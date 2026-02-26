@@ -1,0 +1,263 @@
+float WaterHeight(vec3 p, int waveCount)
+{
+    float h = WaveHeight(p.xz * .1, iTime, waveCount) + oceanHeight;
+    return h;
+}
+
+float GroundHeight(vec3 p)
+{
+    float h = 0.;
+    float tw = 0.;
+    float w = 1.;
+    p *= 0.2;
+    p.xz += vec2(-1.25, .35);
+    for(int i = 0; i < 2; i++) {
+        h += w * sin(p.x) * sin(p.z);
+        const float s = 1.173f;
+        tw += w;
+        p *= s;
+        p.xz += vec2(2.373, 0.977);
+        w /= s;
+    }
+    h /= tw;
+    float hGround = -.2 + 1.65 * h;
+    return hGround;
+}
+
+float sdOcean(vec3 p)
+{
+    float dh = p.y - WaterHeight(p, numWaves);
+    dh *= 0.75; // smaller steps to fix artifacts/bad sdf
+    
+    return dh;
+}
+
+float sdOcean_Levels(vec3 p, int waveCount)
+{
+    float dh = p.y - WaterHeight(p, waveCount);
+    dh *= 0.75; // smaller steps to fix artifacts/bad sdf
+    
+    return dh;
+}
+
+int material;
+float map(vec3 p, bool includeWater)
+{
+    float hGround = GroundHeight(p);
+    float dGround = p.y - hGround;
+    dGround *= 0.9;
+    float d = dGround;
+    
+    material = MAT_GROUND;
+    if(includeWater) {
+        float dOcean = sdOcean(p);
+        material = dOcean < d ? MAT_OCEAN : material;
+        d = min(d, dOcean);
+    }
+    return d;
+}
+
+float RM(vec3 ro, vec3 rd)
+{
+    float t = 0.;
+    float s = 1.;
+    for(int i = 0; i < STEPS; i++) {
+        float d = map(ro + t * rd, true);
+        if(d < 0.001) return t;
+        t += d * s;
+        s *= 1.02;
+    }
+    
+    return -t;
+}
+
+float RM_Ground(vec3 ro, vec3 rd)
+{
+    float t = 0.;
+    for(int i = 0; i < STEPS_GROUND; i++) {
+        float d = map(ro + t * rd, false);
+        if(d < 0.001) return t;
+        t += d;
+    }
+    
+    return -t;
+}
+
+// from: https://iquilezles.org/articles/normalsSDF/
+vec3 Normal( vec3 p)
+{
+    const float h = 0.001f;
+    const vec2 k = vec2(1,-1);
+    return normalize( k.xyy*map( p + k.xyy*h, true) + 
+                      k.yyx*map( p + k.yyx*h, true ) + 
+                      k.yxy*map( p + k.yxy*h, true ) + 
+                      k.xxx*map( p + k.xxx*h, true ) );
+}
+
+vec3 WaveNormal_Levels(vec3 p, int levels)
+{
+    const float h = 0.001f;
+    const vec2 k = vec2(1,-1);
+    return normalize( k.xyy*sdOcean_Levels( p + k.xyy*h, levels) + 
+                      k.yyx*sdOcean_Levels( p + k.yyx*h, levels ) + 
+                      k.yxy*sdOcean_Levels( p + k.yxy*h, levels ) + 
+                      k.xxx*sdOcean_Levels( p + k.xxx*h, levels ) );
+}
+
+
+// from: https://www.shadertoy.com/view/ssfBDf
+float water_caustics(vec3 pos) {
+    vec4 n = snoise( pos );
+
+    pos -= 0.07*n.xyz;
+    pos *= 1.62;
+    n = snoise( pos );
+
+    pos -= 0.07*n.xyz;
+    n = snoise( pos );
+
+    pos -= 0.07*n.xyz;
+    n = snoise( pos );
+    return n.w;
+}
+
+void DarkenGround(inout vec3 col, vec3 groundPos, float oceanHeight, out float wetness)
+{
+    wetness = 1. - smoothstep(0.05, 0.2, groundPos.y - oceanHeight - .3);
+    col = mix(col, col * vec3(.95,0.92,0.85) * 0.8, wetness);
+}
+
+vec3 Reflection(vec3 refl, float fresnel)
+{
+    float spec = max(0., dot(refl, -ld));
+    //spec = max(spec, dot(refl,normalize(ld*vec3(.125,-1,.125)))); // secondary reflections
+    spec = pow(spec, 256.);
+    vec3 col = spec * vec3(1.);
+    col += fresnel * textureLod(iChannel0, refl, 0.).rgb * 0.4;
+    return col;
+}
+
+float Fresnel(vec3 rd, vec3 nor)
+{
+    float fresnel = 1. - abs(dot(nor, rd));
+    fresnel = pow(fresnel, 6.f);
+    return fresnel;
+}
+
+vec3 Render(float t, vec3 ro, vec3 rd)
+{
+    // not hit -> Render BG
+    if(t < 0.f) {
+        vec3 col = vec3(0.35f, 0.62f, 0.9f);
+        col = mix(col, vec3(1.f), max(0.f, (1.f - rd.y) * 0.3f));
+        float sunDot = max(0., dot(rd, -ld));
+        // TODO: Very weird issue when turning on the fog: too high powers cause upper sky to turn black
+        // => WHY?! What does the compiler turn this into? Seems to be nan but isnan() returns false... BUG?
+        sunDot = pow(sunDot, 6.f);
+        sunDot = tanh(sunDot);
+        col += sunDot * vec3(1,0.8,0.7);
+        t = 10000.;
+        ApplyFog(col, t, ro, rd);
+        // weird... => black sky for all these 3 cases, how can length(col) neither be less than or greater than 0 and also not be nan??
+        //col = vec3((length(col) >= 0.) ? 1. : 0.);
+        //col = vec3((length(col) < 0.) ? 1. : 0.);
+        //col = vec3(isnan(length(col)) ? 1. : 0.);
+        return col; 
+    }
+    
+    // TODO: I find this switch statement a bit awkward... Especially if there were more objects/materials...
+    // => factor out commonalities and make it a bit slimmer
+    vec3 p = ro + t * rd;
+    vec3 refl;
+    vec3 pGround;
+    const vec3 groundCol = vec3(.9,.85,.7);
+    vec3 col = groundCol;
+    vec3 transmittance = vec3(1.);
+    switch(material) {
+        case MAT_OCEAN:
+        {
+            float hGround = GroundHeight(p);
+            float dGround = p.y - hGround;
+            float nearShoreAlpha = 1. - smoothstep(.5, -.2,hGround - oceanHeight); 
+            
+            vec3 nor = Normal(p);
+            nor = normalize(mix(nor, vec3(0,1,0), nearShoreAlpha * .9));
+            refl = reflect(rd, nor);
+            vec3 refr = refract(rd, nor, 1./1.2);
+            if(refr == vec3(0)) refr = refl;
+            
+            float tGround = RM_Ground(p, refr);
+            //tGround = max(0., tGround);
+            if(tGround < 0.) tGround = 4.; // crude fix
+            pGround = p + tGround * refr;
+            
+            float fresnel = Fresnel(rd, nor);
+            vec3 norSubsurf = WaveNormal_Levels(p, numWaves/3);
+            const vec3 ldSubsurf = ld * vec3(1,-1,1);
+            float subsurf = max(0.f, max(0., dot(rd,-ldSubsurf)) * dot(norSubsurf, ldSubsurf));
+            //subsurf = max(subsurf, dot(norSubsurf, -ld * vec3(1,1,1)));
+            subsurf = pow(subsurf, 2.f);
+            subsurf *= 1. - fresnel;
+            subsurf *= .5;
+            
+            float wetness;
+            DarkenGround(col, pGround, oceanHeight, wetness);
+            
+            float spec = max(0., dot(refl, -ld));
+            //spec = max(spec, dot(refl,normalize(ld*vec3(.125,-1,.125)))); // secondary reflections
+            spec = pow(spec, 256.);
+            
+            transmittance = exp(-tGround*waterAbsorp/waterCol);
+            float waterAlpha = 1.-exp(-tGround*waterAbsorp * 0.5);
+    
+            vec3 causticPos = pGround * 2. + vec3(0, iTime*.15, 0);
+            float causticAlpha = 1. - saturate(exp(-tGround * 2.));
+            causticNoiseBlur = 1. - min(1., causticAlpha * 2.);
+            vec3 o = vec3(1.0, 0.0, 1.0)*0.02;
+            vec3 caustics;
+            caustics.x = mix(water_caustics(causticPos + o), water_caustics(causticPos + o + 1.), 0.5);
+            caustics.y = mix(water_caustics(causticPos + o*4.0), water_caustics(causticPos + o + 1.), 0.5);
+            caustics.z = mix(water_caustics(causticPos + o*6.0), water_caustics(causticPos + o + 1.), 0.5);
+            caustics = exp(caustics*4. - 1.);
+            caustics *= causticAlpha;
+            col += caustics;
+            
+            col *= transmittance;
+            col += tGround * exp(-tGround * waterAbsorp) * waterCol * .3;
+            col += subsurf * subsurfCol;
+            col += Reflection(refl, fresnel);
+            
+            // foam (bad)
+            // TODO: add actually good looking foam...
+            //col = mix(col, vec3(1.), smoothstep(.2, .15, dGround - .2 + 0.8 * WaveHeight(p.xz * .1, iTime, numWaves)));
+            
+        } break;
+        case MAT_GROUND:
+        {
+            pGround = p;
+            float wetness;
+            DarkenGround(col, pGround, oceanHeight, wetness);
+            
+            vec3 nor = Normal(p);
+            vec3 refl = reflect(rd, nor);
+            float fresnel = Fresnel(rd,nor);
+            col += wetness * Reflection(refl, fresnel);
+        } break;
+    }
+
+    ApplyFog(col, t, ro, rd);
+    return col;
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    vec2 uv = (2.f * fragCoord - iResolution.xy) / iResolution.y;
+    vec3 ro, rd;
+    RORD(uv, ro, rd, iTime, iChannel1);
+    float d = RM(ro,rd);
+    
+    vec3 col = Render(d, ro, rd);
+    col = pow(col, vec3(1.f/2.2f));
+
+    fragColor = vec4(col,1.0);
+}
