@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { oceanVertexShader, oceanFragmentShader } from './OceanShader';
 
 export class SceneManager {
@@ -10,6 +11,10 @@ export class SceneManager {
     private mesh: THREE.Mesh | null = null;
     private clock: THREE.Clock;
     private animationFrameId: number | null = null;
+
+    // We use a PerspectiveCamera just for the OrbitControls math
+    private virtualCamera: THREE.PerspectiveCamera;
+    private controls: OrbitControls;
 
     constructor(container: HTMLDivElement) {
         this.container = container;
@@ -24,7 +29,16 @@ export class SceneManager {
         this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
         this.camera.position.z = 1;
 
-        // 3. Clock for time
+        // 3. Setup Virtual Camera and Controls for the Shader
+        this.virtualCamera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 1000);
+        this.virtualCamera.position.set(0, 1.5, -12);
+
+        this.controls = new OrbitControls(this.virtualCamera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.05;
+        this.controls.target.set(0, 0.2, 0); // Look at the beach initially
+
+        // 4. Clock for time
         this.clock = new THREE.Clock();
 
         // Initialize
@@ -62,10 +76,9 @@ export class SceneManager {
     private updateCameraUniforms() {
         if (!this.material) return;
 
-        // In a real app, these might be driven by user input or animations
-        // For now, let's look roughly down at the beach
-        const cameraPos = new THREE.Vector3(10, 4, 10);
-        const lookAt = new THREE.Vector3(0, 0, 0);
+        // Stand on the beach, looking out towards the sea
+        const cameraPos = new THREE.Vector3(0, 1.5, -12);
+        const lookAt = new THREE.Vector3(0, 0.2, 0);
 
         const cf = new THREE.Vector3().subVectors(lookAt, cameraPos).normalize();
         const cr = new THREE.Vector3().crossVectors(cf, new THREE.Vector3(0, 1, 0)).normalize();

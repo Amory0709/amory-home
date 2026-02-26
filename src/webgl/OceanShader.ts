@@ -158,21 +158,16 @@ export const oceanFragmentShader = `
   }
   
   float GroundHeight(vec3 p) {
-      float h = 0.0;
-      float tw = 0.0;
-      float w = 1.0;
-      p *= 0.2;
-      p.xz += vec2(-1.25, 0.35);
-      for(int i = 0; i < 2; i++) {
-          h += w * sin(p.x) * sin(p.z);
-          const float s = 1.173;
-          tw += w;
-          p *= s;
-          p.xz += vec2(2.373, 0.977);
-          w /= s;
-      }
-      h /= tw;
-      return -0.2 + 1.65 * h;
+      // Create a smooth beach slope going down towards the positive Z axis
+      float slope = -0.06;
+      float h = p.z * slope;
+      
+      // Add very gentle, wide undulations to the shoreline so it's not perfectly straight
+      h += sin(p.x * 0.1) * 0.5;
+      h += sin(p.x * 0.3) * 0.15;
+      
+      // Offset so the beach meets the water gracefully
+      return h - 0.2;
   }
   
   float sdOcean(vec3 p) {
