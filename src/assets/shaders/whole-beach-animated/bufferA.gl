@@ -1,0 +1,1617 @@
+//
+//This is where the magic happens...
+//
+
+
+// I wonder what that does... try it ?
+#define BIRDS_EYE_VIEW 1
+
+
+// Material Ids
+const uint kSandMatId = 0u;
+const uint kWaterMatId = 1u;
+const uint kFoamMatId = 2u;
+const uint kRockMatId = 3u;
+const uint kBirdsMatId = 4u;
+
+// Part Ids
+const uint kIslandPartId = 1u;
+const uint kWaterPartId = 1u << 1u;
+const uint kFoamPartId = 1u << 2u;
+const uint kWaveFoamPartId = 1u << 3u;
+const uint kRockPartId = 1u << 4u;
+const uint kBirdsPartId = 1u << 5u;
+
+// Constants
+const float kWaterFbmScale = 0.25 * 0.05;
+const float kWaterFbmAmount = 0.075;
+const float kMaxDist = 600.;
+const float kDistanceEpsilon = 0.0005;
+const float kStepEpsilon = 0.001;
+
+const vec3 kIslandSphereCenterWS = vec3(-775.0, -10000.0, 0.0);
+const float kIslandSphereRadius = 10030.0;
+
+const float kTimeScale = 1.0f;
+#if BIRDS_EYE_VIEW
+const float kWalkRotationTimeScale = 10.0f;
+#else
+const float kWalkRotationTimeScale = 1.0f;
+#endif
+
+const float kCameraPlaneDist = 2.0;
+
+
+// Globals (ugly but convenient)
+
+float s_flare = 0.0;
+vec3 s_eyePosWS = oz.yyy;
+float s_pixelSpacingAtUnitLengthWS = 0.0001;
+float s_time = 0.0;
+
+
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////// Distance functions //////////////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+
+
+//The camera doesn't actually move around the island
+//The world spins instead
+//This allows us to not have to worry about making the wave direction match the island
+//They always come from the +x direction (in non-rotated WS)
+vec3 computeWalkRotatedPosWS(vec3 posWS, float time)
+{
+    //The rock noise gets weird if we rotate too much, so reset after a while
+#if BIRDS_EYE_VIEW    
+    float walkTime = mod(time , 2.0*158.0) * kWalkRotationTimeScale; 
+#else
+    float walkTime = mod(time , 4.0*158.0) * kWalkRotationTimeScale; 
+#endif    
+    vec3 islandCenteredPosWS = posWS - kIslandSphereCenterWS;
+    pR(islandCenteredPosWS.xz, -walkTime * 0.001);
+    posWS = islandCenteredPosWS + kIslandSphereCenterWS;
+    
+    return posWS;
+}
+
+//Main wave animation :
+// - 1 cylinder rotating around in space
+// - 1 cylinder to carve the wave out of the first one
+// - lots of magic number tweaking
+float fWave(vec3 pos, float waveProgress, float waveStrength, 
+            out float crashDist, out float crashX)
+{
+    float waveBreakProgress = linearstep(0.25, 1.0, waveProgress);
+    float animationTime = (waveProgress - 0.5) * 2.0 * PI;
+
+    const float waveRadius = 1.0;
+    vec3 mainCylinderPos = pos + oz.yxy * 0.5 * waveRadius;
+    vec3 carvedCylinderPos = pos;
+    
+    pR(mainCylinderPos.xy, animationTime);
+
+    mainCylinderPos -= oz.yxy * 0.5 * waveRadius;
+
+    float waveDist = fInfiniteCylinder((mainCylinderPos).xzy, waveRadius);
+    
+    float size = (1.0 - waveBreakProgress*waveBreakProgress);
+    float carvedWaveDist = 
+        fInfiniteCylinder((carvedCylinderPos - waveRadius*vec3(
+            -0.5 - waveBreakProgress*0.6, 
+            0.95*size - waveBreakProgress*waveBreakProgress*size*4.0, 
+            0.0)
+                  ).xzy, waveRadius*size);
+
+    waveDist = max(waveDist, -carvedWaveDist);
+    
+    //Extra cylinder to use to add foam
+    float crashRadius = 
+        0.35*waveRadius*linearstep(0.7, 0.73, waveProgress)*
+        (linearstep(2.0, 0.8, waveStrength) + 2.0*linearstep(1.1, 0.9, waveStrength));
+    
+    vec3 crashCenter = -oz.xyy*waveRadius*1.2 
+        - oz.yxy*(crashRadius*0.4 + linearstep(1.3, 1.6, waveStrength));
+    
+    crashX = pos.x - crashCenter.x;
+    crashDist = fInfiniteCylinder((pos - crashCenter).xzy, crashRadius);
+    
+    return waveDist;
+}
+
+//Distance based roughness
+//Not really proper, but works well enough
+float computeWaterRoughness(vec3 eyeToPosWS)
+{
+    float scale = kWaterFbmScale;
+    float amount = kWaterFbmAmount;
+    
+    float distFromEye = dot(eyeToPosWS, eyeToPosWS);
+    float uvDiff = scale * (2.0/(kCameraPlaneDist))/iResolution.x * distFromEye;
+
+    float roughness = saturate(uvDiff*5.0*kWaterFbmAmount - 0.00);
+    
+    return clamp(roughness, 0.05, 0.5);
+}
+
+float smallWaveDisp(vec3 posWS, float time,
+                       float wavelength, float amplitude)
+{
+    float frequency  = 2.0 * kPI / wavelength;
+
+    float speed           = (30.0 / (frequency * frequency));
+    float phaseShift      = time * speed;
+    float posDotDirection = posWS.x;//hardcoded for (1.0, 0.0) directions
+
+    float wave = sin(posDotDirection * frequency + phaseShift);
+    wave = wave * 0.5 + 0.5;
+    wave = wave*wave * 2.0 - 1.0;
+    
+    return wave * amplitude;
+}
+
+float computeWaterFbm(vec3 posWS, vec3 originalPosWS, float time)
+{   
+    float totalDisp = 0.0;
+    float maxDisp = 0.0;
+    float amplitude = 0.5;
+    float wavelength = 2.0;
+    
+    vec3 vecToEye = originalPosWS - s_eyePosWS;
+    float sqDistFromEye = dot(vecToEye, vecToEye);
+#if BIRDS_EYE_VIEW    
+    uint numSteps = 3u + uint(3.1 * (1.0 - min(1.0, sqDistFromEye/(50.0*50.0))));
+#else
+    uint numSteps = 1u + uint(5.1 * (1.0 - min(1.0, sqDistFromEye/(50.0*50.0))));
+#endif
+    
+    float tempAmplitude = amplitude;
+    maxDisp += tempAmplitude; tempAmplitude *= 0.7;
+    maxDisp += tempAmplitude; tempAmplitude *= 0.7;
+    maxDisp += tempAmplitude; tempAmplitude *= 0.7;
+    maxDisp += tempAmplitude; tempAmplitude *= 0.7;
+    maxDisp += tempAmplitude; tempAmplitude *= 0.7;
+    maxDisp += tempAmplitude;
+    
+    float wind = time*0.1;
+
+    for(uint i = 0u; i < numSteps; ++i)
+    {
+        vec3 dPos = posWS;
+        dPos.x += 4.0*amplitude*cos(posWS.z * 0.5/wavelength + wind/(wavelength*wavelength));
+        float disp = smallWaveDisp(dPos, time, wavelength, amplitude);
+        
+        totalDisp += disp;
+        
+        pR(posWS.xz, kGoldenRatioConjugate * 2.0 * PI);
+        wavelength *= 0.7;
+        amplitude *= 0.7;
+    }
+    
+    return (totalDisp / maxDisp)*0.5;
+}
+
+////////////////////////
+
+float getPebbleDisp(vec3 posWS, vec3 originalPosWS, out float rocks)
+{
+    rocks = 0.0;
+
+    // Distance based mip selection, not proper, but good enough alternative to
+    // derivatives (which just break down in raymarching loops)    
+    vec3 eyeToPosWS = originalPosWS - s_eyePosWS;
+    vec3 eyeToPosDirWS = normalize(eyeToPosWS);
+    float distToEye = length(eyeToPosWS);
+    float distBetweenPixelsWS = s_pixelSpacingAtUnitLengthWS * distToEye;
+    float uvGrad = distBetweenPixelsWS * 0.4;
+    float pixelGrad = uvGrad * 0.5 * 512.0 / max(0.0001, abs(eyeToPosDirWS.y));
+    float lod = clamp(log2(pixelGrad) - 1.0, 0.00001, 8.0);
+    
+    
+    vec2 rocksUv = posWS.xz * 0.4;
+    rocks = textureLod(iChannel3, rocksUv, lod).r;
+
+    rocksUv = posWS.xz * 0.5;
+    pR(rocksUv, kPI * kGoldenRatioConjugate);
+    rocks = max(rocks, textureLod(iChannel3, rocksUv, lod).r); 
+
+    
+    float lodOffset = max(0.0, 1.0 - pow(0.8, max(0.0, lod - 1.0)));
+    float rockThreshold = min(0.7, 1.0 - lodOffset);
+    
+    float rockStrength = rocks * saturate(1.1 - posWS.y*posWS.y);
+    rockStrength = max(0.0, rockStrength - rockThreshold)/(1.0 - rockThreshold);
+
+    return rockStrength;
+
+    return 0.0;
+}
+    
+float fIsland(vec3 posWS, vec3 originalPosWS, out vec3 vecToIslandCenter)
+{
+    vecToIslandCenter = posWS - kIslandSphereCenterWS;
+    
+    //Reduce precision issues getting the distance to this massive sphere
+    float precisionMult = 0.05;
+    
+    float islandDist = fSphere(
+        vecToIslandCenter*precisionMult, 
+        kIslandSphereRadius*precisionMult)/precisionMult;
+    
+    float disp = sin(length(vecToIslandCenter.xz)*2.0) * 0.5;
+    disp += sin(length(vecToIslandCenter.xz)*0.3) * 2.0;
+    vecToIslandCenter += disp*oz.xxx*0.5;
+    
+    disp += sin((vecToIslandCenter.z + vecToIslandCenter.x)*0.5) * 0.75;
+    disp += sin((vecToIslandCenter.z - vecToIslandCenter.x)*0.2) * 2.0;
+    islandDist += disp*0.15 * saturate((posWS.y - 0.15) * 0.5);
+        
+    float unusedRocks;
+	islandDist -= getPebbleDisp(posWS, originalPosWS, unusedRocks) * 0.06;
+    
+    return islandDist;
+}
+
+float fRockDisp(float rock, vec3 posDispWS, float radius, float fbm)
+{
+#if 0
+    return rock;
+#else    
+
+    rock += fbm*2.0*min(radius*0.45, (0.8 + abs(-0.5 + posDispWS.y * 0.5)));   
+    
+    return rock;
+#endif    
+}
+
+
+float fRock(vec3 posWS, vec3 posDispWS, float radius, float height,
+           inout float stream)
+{
+    //-1 is up stream, 1 is down stream
+    stream = max(stream, -normalize(posWS).x);
+    float rock = fCapsule(posWS, radius, height);
+    
+    return rock;
+}
+
+float rockFbm(vec3 posWS)
+{
+    float fbm = 0.0;
+    float seed = 0.1537;
+    vec3 uv = (posWS + oz.xyx * posWS.y*2.0) * 0.005 + oz.xxx*seed;
+    //vec2(posWS.x + posWS.z - posWS.y, posWS.y*8.0 + posWS.z - posWS.x)*0.001;
+    uv = fract(uv);
+    fbm += 1.000 * textureLod(iChannel1, uv * 1.0, 0.0).r;
+    fbm += 0.500 * textureLod(iChannel1, uv * 3.5, 0.0).r;
+    fbm += 0.250 * textureLod(iChannel1, uv * 12.0, 0.0).r;
+    fbm += 0.125 * textureLod(iChannel1, uv * 42.0, 0.0).r;
+    fbm /= 1.875;    
+
+    return fbm;
+}
+
+float fRocks(vec3 posWS, float islandDist, out float stream)
+{   
+    stream = -1.0;
+    
+    float cliffShift = textureLod(iChannel3, posWS.xz * 0.005, 0.0).r;
+    
+    vec3 shiftedPosWS = posWS;
+    shiftedPosWS += (cliffShift - 0.5) * 7.0 * vec3(1.0, 0.5, 1.0);
+    vec3 rocksPosWS = posWS - (cliffShift - 0.5) * 3.0 * oz.xyx - oz.yyx * 30.0;
+    
+    float rock1 = fRock(
+        rocksPosWS - oz.xyy * 15.0, posWS, 4.0, 3.0, stream);
+    
+    float rocks = rock1;
+    
+    if(rock1 < 20.0)
+    {
+        float fbm = rockFbm(posWS * 1.5);
+        
+        float rock2 = fRock(
+            rocksPosWS - oz.xyy * 15.0 - oz.xyx*9.0, posWS, 3.0, 3.0, stream);    
+
+        float rock3 = fRock(
+            rocksPosWS - oz.xyy * 10.0 + oz.xyy*3.0, posWS, 2.5, 2.0, stream);
+
+        rocks = min(rocks, rock2);
+        rocks = min(rocks, rock3);
+
+        rocks = fRockDisp(rocks, posWS, 3.0, fbm);
+    }
+    else
+    {
+        rocks -= 10.0;
+    }
+    
+    float cliff = 
+        fTorus(shiftedPosWS - kIslandSphereCenterWS * oz.xyx - oz.yxy * 5.0,
+                7.0, 730.0);
+    
+    if(cliff < 10.0)
+    {
+        float cliffFbm = rockFbm(posWS * 0.5);
+        
+    	cliff = fRockDisp(cliff, posWS - oz.yxy * 2.0, 5.0, cliffFbm);
+    }
+    rocks = min(rocks, cliff);
+    
+    float distantIsland = fSphere(shiftedPosWS - oz.xyy * 3600.0
+                           + oz.yyx * 1400.0, 3500.0);
+    distantIsland = max(distantIsland, shiftedPosWS.y - 20.0);
+    
+    if(distantIsland < 20.0)
+    {
+        float distFbm = rockFbm(posWS * 0.2)*2.0 - 1.0;
+		distantIsland -= distFbm * 15.0 * clamp((30.0 - posWS.y)/20.0, 0.5, 1.0);
+    }
+    rocks = min(rocks, distantIsland);
+  
+    return rocks;
+}
+
+float fFoamDisp(vec3 posWS, 
+                float minDist,
+                float islandDist, 
+                float rockFoamAmount,
+                float waveFoamAmount,
+                float underwaterCrashFoamAmount,
+                float waterFbm, float time,
+                out float outUnderWaterFoamAmount)
+{
+    waterFbm = clamp(waterFbm, -0.5, 0.5);
+#if 0
+    return kMaxDist;
+#else
+    float foamDist = kMaxDist;
+    float sphereRadius = 0.05;
+
+    outUnderWaterFoamAmount = linearstep(
+        0.50 - waveFoamAmount*3.0 - rockFoamAmount*3.0 - underwaterCrashFoamAmount*3.0,
+        0.55 - waveFoamAmount*0.25 - rockFoamAmount*0.25 - underwaterCrashFoamAmount * 0.25, 
+        waterFbm);
+	outUnderWaterFoamAmount *= outUnderWaterFoamAmount;
+    
+    
+    float foamAmount = linearstep(
+        0.50 - waveFoamAmount*1.5 - rockFoamAmount*1.5,
+        0.55 - waveFoamAmount*0.5 - rockFoamAmount*0.5, 
+        waterFbm);
+    
+    
+    vec3 repPos = posWS - time * oz.yxx * sphereRadius * 0.0;
+    pMod2(repPos.xz, vec2(sphereRadius*1.5));
+    repPos.y = minDist;
+    foamDist = fSphere(repPos, sphereRadius);
+    
+    repPos = posWS + time * oz.xxx * sphereRadius * 0.0;
+    pR(repPos.xz, kGoldenRatioConjugate * 2.0 * PI);
+    pMod2(repPos.xz, vec2(sphereRadius*1.5));
+    repPos.y = minDist;    
+    foamDist = min(foamDist, fSphere(repPos, sphereRadius));
+    
+    //Add some bubbles t o the underwater foam too
+    float underwaterFoamDist = foamDist - 0.02;
+    outUnderWaterFoamAmount = saturate(
+        mix(outUnderWaterFoamAmount, max(0.0, -underwaterFoamDist)*10.0 + outUnderWaterFoamAmount,
+            outUnderWaterFoamAmount));
+    
+    float oneMinusFoamAmount = (1.0 - foamAmount);
+    oneMinusFoamAmount *= oneMinusFoamAmount;
+    
+    //Remove the buddles where we don't have foam
+    foamDist += linearstep(0.5 - oneMinusFoamAmount*2.0, 
+                           0.55 - oneMinusFoamAmount*1.0, 
+                           waterFbm) * sphereRadius*1.05;
+    
+    return -min(sphereRadius*2.0, -foamDist);
+#endif    
+}
+
+
+vec3 computeVecToBird(vec3 posWS, vec3 centerWS, float time)
+{
+#if BIRDS_EYE_VIEW
+    time *= 1.2;
+#endif    
+    posWS -= centerWS;
+    pR(posWS.xz, -time*0.4);
+    posWS.x += 15.0;
+    return posWS;
+}
+
+float fBird(vec3 posWS, vec3 centerWS, float time, out float wingTip)
+{
+    vec3 dToBirdWS = computeVecToBird(posWS, centerWS, time);
+    
+    float fCenter = length(dToBirdWS);
+	wingTip = 0.0;
+    
+    if(fCenter < 1.0)
+    {
+        float bank = sin(time*0.5);
+        float gliding = max(0.0, abs(bank)*abs(bank)*1.5 - 0.5);
+        pR(dToBirdWS.xy, bank*0.2*kPI); //roll
+
+        vec3 dWings = dToBirdWS - oz.yyx * 0.17;
+        dWings.x = abs(dWings.x) - 0.05;
+        dWings.z += dWings.x*dWings.x * 0.4;
+        pR(dWings.xy, sin(time*13.0)*0.12*kPI*gliding - 0.1); //flap
+
+        float bodyDist = sdRoundCone(dToBirdWS.xzy, 0.12, 0.01, 0.35);
+        float wingsDist = sdRoundCone(dWings.yxz, 0.08, 0.005, 0.6);
+
+        bodyDist = max(bodyDist, abs(dToBirdWS.y)-0.05); 
+        wingsDist = max(wingsDist, abs(dWings.y)); 
+
+        wingTip = saturate(dWings.x / 0.6);
+        
+        return fOpUnionRound(wingsDist, bodyDist, 0.05);
+    }
+    
+    return fCenter - 0.5;
+}
+
+
+#if BIRDS_EYE_VIEW
+const vec3 kBird0CurveCenterWS = vec3(5.0, 7.0, -15.0);
+const vec3 kBird1CurveCenterWS = vec3(-20.0, 10.0, -7.0);
+const vec3 kBird2CurveCenterWS = vec3(20.0, 5.0, 00.0);
+#else
+const vec3 kBird0CurveCenterWS = vec3(00.0, 7.0, -40.0);
+const vec3 kBird1CurveCenterWS = vec3(00.0, 5.0, -20.0);
+const vec3 kBird2CurveCenterWS = vec3(20.0, 12.0, 00.0);
+#endif
+
+float fBirds(vec3 posWS, out float wingTip)
+{
+    wingTip = 0.0;
+    
+    float time = s_time * kTimeScale;
+    float birdsDist = kMaxDist;
+    
+    float tempWingTip, tempBirdDist;
+    tempBirdDist = fBird(posWS, kBird0CurveCenterWS, time, tempWingTip);
+    wingTip = max(wingTip, tempWingTip);
+    birdsDist = min(birdsDist, tempBirdDist);
+    
+    tempBirdDist = fBird(posWS, kBird1CurveCenterWS, time * 1.3 - 23.0, tempWingTip);
+    wingTip = max(wingTip, tempWingTip);
+    birdsDist = min(birdsDist, tempBirdDist);
+    
+    tempBirdDist = fBird(posWS, kBird2CurveCenterWS, time + 14.0, tempWingTip);
+    wingTip = max(wingTip, tempWingTip);
+    birdsDist = min(birdsDist, tempBirdDist);
+    
+    return birdsDist;
+}
+
+#define MARCH_BIRDS 1
+
+float fBeachWaterDist(vec3 posWS, float time, float waterFbm)
+{
+    vec3 originalPosWS = posWS;
+    posWS = computeWalkRotatedPosWS(posWS, time);
+    
+    float waterDist = originalPosWS.y;
+    
+    time *= kTimeScale;
+    
+    vec3 vecToIslandCenter = posWS - kIslandSphereCenterWS;;
+    float waveStrength = 1.0 - ((length(vecToIslandCenter.xz) - 780.0) * 0.04);
+
+    
+    vec3 scrollPos = originalPosWS;
+    //Offset the wave a bit to make them look less straight
+    float subtleCurving = sin(posWS.z * 0.04) * 2.0 - 1.0;
+    scrollPos.x += (time)*2.0 + subtleCurving;
+    
+    float distBetweenWaves = 20.0;
+    
+    float waveCenterX = mod(scrollPos.x+2.0, distBetweenWaves);
+    float beachRecess = linearstep(distBetweenWaves*0.9, 4., waveCenterX);
+    float beachClimb = linearstep(0.5, 1., waveCenterX) 
+        * beachRecess * beachRecess;
+
+    
+    waterDist -= linearstep(0.9, 1.3, waveStrength) * (beachClimb) * 0.2;  
+	float waterDisp = waterFbm * kWaterFbmAmount;
+    waterDist -= waterDisp;
+                 
+	return waterDist;
+}
+
+float fSDF(vec3 posWS, uint partSelection,
+           out uint materialID, out float foamAmount, out float taaStrength)
+{
+    vec3 originalPosWS = posWS;
+    posWS = computeWalkRotatedPosWS(posWS, s_time);
+    
+    float time = s_time * kTimeScale;
+    
+ 	float minDist = kMaxDist;
+    // --- Water plane --- //
+    float waterDist = originalPosWS.y;
+    
+    // --- Island --- //
+    vec3 vecToIslandCenter;
+    float islandDist = fIsland(posWS, originalPosWS, vecToIslandCenter);
+    
+    // --- Rocks --- //
+    float rocksStream = -1.0;
+    float rocksDist = fRocks(posWS, islandDist, rocksStream);
+    float rocksCloseness = linearstep(10.0, 0.5, rocksDist);
+    
+    float waveStrength = 1.0 - ((length(vecToIslandCenter.xz) - 780.0) * 0.04);
+    
+    float waveDist = kMaxDist;
+    float waveAnimProgress = 0.0;
+    float waveFoamAmount = 0.0;
+    float waveCrashDist = kMaxDist;
+    float waveCrashX = 0.0;
+    
+    if(waveStrength > 0.001 && waveStrength < 2.0)
+    {
+        vec3 scrollPos = originalPosWS;
+        //Offset the wave a bit to make them look less straight
+        float subtleCurving = sin(posWS.z * 0.04) * 2.0 - 1.0;
+        scrollPos.x += (time)*2.0 + subtleCurving;
+
+        float saturatedWaveStrength = saturate(waveStrength);
+        //expWaveProgress : start slow, crash fast.
+        float expRate = 200.0;
+        float expWaveProgress = 
+            mix(saturatedWaveStrength, 
+                (pow(max(0.0001, 1.0 + expRate), saturatedWaveStrength) - 1.0)/expRate, 
+                linearstep(0.1, 0.7, saturatedWaveStrength));
+
+        float distBetweenWaves = 20.0;//32.0;
+        vec3 repeatPos = scrollPos;
+        float id = pMod1(repeatPos.x, distBetweenWaves);
+
+        
+		waveDist = fWave(repeatPos, expWaveProgress, waveStrength, waveCrashDist, waveCrashX);
+
+        //When close to rocks, reduce wave, increase water height
+        waterDist -= linearstep(1.5, 0.15, waveDist) 
+            * min(0.2, mix(rocksCloseness*1.0, rocksCloseness*0.2, max(0.0, rocksStream)));
+        float waveReduction = mix(rocksCloseness*0.1, rocksCloseness*0.5, max(0.0, rocksStream));
+        waveDist += waveReduction;
+        waveCrashDist += waveReduction * 0.5; 
+        
+        waterDist = min(waterDist, waveDist);
+        waterDist = fOpUnionSoft(waterDist, waveDist, 0.25*(1.0 - expWaveProgress));       
+        
+        float waveCenterX = mod(scrollPos.x+2.0, distBetweenWaves);
+        float beachRecess = linearstep(distBetweenWaves*0.9, 4., waveCenterX);
+        float beachClimb = linearstep(0.5, 1., waveCenterX) 
+            * beachRecess * beachRecess;
+        
+        waterDist -= linearstep(0.9, 1.3, waveStrength) * (beachClimb) * 0.2;
+        
+        waveAnimProgress = 0.5 + (repeatPos.x/distBetweenWaves);
+        
+        float postBreakage = min(1.0,(1.9 - waveStrength));
+        float foamClimb = linearstep(10.0, 0.0, waveCrashX) * linearstep(-0.5, 0.0, waveCrashX);
+        
+        waveFoamAmount = 1.0 * foamClimb * foamClimb * linearstep(0.89, 1.0, waveStrength);
+    }
+    
+	float foamDist = kMaxDist;
+    float foamDisp = 0.0;
+    
+    float waterFbm = 0.0;
+    
+    if(waterDist < 2.0)
+    {
+        float waterDisp = 0.0;
+
+        float waveOffset = 0.0;
+        vec3 sinWavePos = posWS * 0.5;
+        waveOffset += cos((sinWavePos.x) * 0.5 + time * 0.5) * 2.0;
+        sinWavePos.x += waveOffset * 4.0;
+        pR(sinWavePos.xz, kGoldenRatioConjugate * 2.0 * PI);
+        waveOffset *= cos((sinWavePos.x) * 1.0 + time * 0.25);
+
+        waveOffset = waveOffset/2.0 * 0.5 + 0.5;
+        waveOffset *= waveOffset;
+		waveOffset = waveOffset*2.0 - 1.0;
+        
+        waterDisp += waveOffset * 0.2 * (linearstep(1.0, 0.0, waveStrength));
+
+        waterFbm = computeWaterFbm(posWS, originalPosWS, time);
+        float waveInducedAmount = saturate(1.0 - waveDist*0.5);
+        waveInducedAmount *= 0.2 * waveInducedAmount * waveInducedAmount;
+
+        float rockInducedFbmAmount = rocksCloseness*rocksCloseness*rocksCloseness * 0.5;
+        waterFbm *= (linearstep(-0.1, 0.1, islandDist) + min(1.0, waveInducedAmount + rockInducedFbmAmount)*5.0);
+        waterDisp += waterFbm * kWaterFbmAmount;
+
+        waterDist -= waterDisp;
+        waveCrashDist -= waterFbm*0.3*(0.25 + linearstep(1.5, 1.0, waveStrength)
+                                       *linearstep(0.8, 1.0, waveStrength));
+        
+        // --- Foam --- //
+
+        float rockFoamAmount = 0.75 * linearstep(0.8, 1.0, rocksCloseness);
+        rockFoamAmount += 0.5 * linearstep(0.85, 1.00, rocksCloseness) * (rocksStream*0.5 + 0.5) 
+            * linearstep(5.0, 1.0, waveDist);
+
+        float underwaterCrashFoamAmount = 
+            linearstep(2.0, 0.0, waveCrashDist);
+        underwaterCrashFoamAmount *= 0.65*underwaterCrashFoamAmount*linearstep(0.90, 0.95, waveStrength);
+
+        foamDist = min(waterDist, waveCrashDist);
+        foamDisp = fFoamDisp(posWS, waterDist, islandDist, rockFoamAmount, 
+                             waveFoamAmount, underwaterCrashFoamAmount, waterFbm, time, foamAmount);
+
+
+    }
+    
+    // --- Filters --- //
+    
+    if((partSelection & kWaveFoamPartId) == 0u)
+    {
+        waveCrashDist = kMaxDist;
+    }
+    
+    if((partSelection & kIslandPartId) == 0u)
+    {
+        islandDist = kMaxDist;        
+    }
+    
+    if((partSelection & kRockPartId) == 0u)
+    {
+        rocksDist = kMaxDist;
+    }
+    
+    // --- Birds --- //
+#if MARCH_BIRDS  
+    float birdsDist = kMaxDist;
+    if((partSelection & kBirdsPartId) != 0u)
+    {
+        float unusedWings;
+        birdsDist = fBirds(originalPosWS, unusedWings);
+    }
+#endif    
+    
+    if((partSelection & kWaterPartId) == 0u)
+    {
+        waterDist = kMaxDist;
+    }
+        
+    float waterFoamDist = waterDist + foamDisp;
+    float waveCrashFoamDist = waveCrashDist + foamDisp;
+    foamDist = min(waterFoamDist, waveCrashFoamDist);
+    
+    if((partSelection & kFoamPartId) == 0u
+      && (partSelection & kWaveFoamPartId) == 0u)
+    {
+        foamDist = kMaxDist;
+    }
+    
+    float waterAndFoamTaa = mix(
+        saturate(min(1.0, waveDist * 1.0) * min(1.0, abs(waveCrashX + 1.0) * 0.1)),
+        1.0, saturate(-waveStrength*4.0 + 4.0));
+    waterAndFoamTaa = 0.2 + 0.8*waterAndFoamTaa;
+    
+    // --- Materials --- //
+    if(minDist > waterDist)
+    {
+        minDist = waterDist;
+        materialID = kWaterMatId;
+        taaStrength = waterAndFoamTaa;
+    }
+    
+    if(minDist > foamDist)
+    {
+        minDist = foamDist;
+        materialID = kFoamMatId;
+        taaStrength = waterAndFoamTaa;
+    }
+    
+    if(minDist > islandDist)
+    {
+        minDist = islandDist;
+        materialID = kSandMatId;
+        taaStrength = waterAndFoamTaa;
+    }
+    
+    if(minDist > rocksDist)
+    {
+        minDist = rocksDist;
+        materialID = kRockMatId;
+        taaStrength = 1.0;
+    }
+    
+#if MARCH_BIRDS    
+    if(minDist > birdsDist)
+    {
+        minDist = birdsDist;
+        materialID = kBirdsMatId;
+        taaStrength = 0.0;
+    }    
+#endif
+    
+    return minDist;
+}
+
+float fSDF(vec3 p, uint partSelection, out uint materialID)
+{
+    float foamAmount = 0.0, taaStrength = 0.0;
+    return fSDF(p, partSelection, materialID, foamAmount, taaStrength);
+}
+
+float fSDF(vec3 p, out uint matId)
+{
+    float foamAmount = 0.0, taaStrength = 0.0;
+    return fSDF(p, 0xffffffffu, matId, foamAmount, taaStrength);
+}
+
+float fSDF(vec3 p)
+{
+    uint matId = 999u;
+    float foamAmount = 0.0, taaStrength = 0.0;
+    return fSDF(p, 0xffffffffu, matId, foamAmount, taaStrength);
+}
+
+vec3 computeNormalForPart(vec3 p, uint partSelect, float dt)
+{
+    //From IQ. https://iquilezles.org/articles/normalsSDF
+    //The loop prevents the silly compiler unrolling the code for fSDF 4 times
+    //Shaved 15s of the (ANGLE) compile times
+    vec3 normalWS = oz.yyy;
+    for( int i=NON_CONST_ZERO; i<4; i++ )
+    {
+        vec3 e = 0.5773*(2.0*vec3((((i+3)>>1)&1),((i>>1)&1),(i&1))-1.0);
+        uint unusedMatId;
+        normalWS += e*fSDF(p + e * dt, partSelect, unusedMatId);
+    }
+    return normalize(normalWS);
+    
+}
+
+vec3 computeWaterPlaneNormal(vec3 posWS, float dt)
+{
+    //Same as above, but only uses the distance for the displaced water plane. A bit simpler.
+    float time = s_time * kTimeScale;
+    
+    vec3 originalPosWS = posWS;
+    posWS = computeWalkRotatedPosWS(posWS, time);
+    
+    vec3 normalWS = oz.yyy;
+    for( int i=NON_CONST_ZERO; i<4; i++ )
+    {
+        vec3 e = 0.5773*(2.0*vec3((((i+3)>>1)&1),((i>>1)&1),(i&1))-1.0);
+        
+        vec3 posOffsetWS = posWS + e * dt;
+        float distToPlane = posOffsetWS.y;
+        distToPlane -= computeWaterFbm(posOffsetWS, originalPosWS, time) * kWaterFbmAmount;
+        
+        normalWS += e*distToPlane;
+    }
+    return normalize(normalWS);    
+}
+
+vec3 fixNormalBackfacingness(vec3 normalWS, vec3 rayDirWS)
+{
+    normalWS -= max(0.0, dot(normalWS, rayDirWS)) * rayDirWS;
+    return normalWS;
+}
+
+float computeWaterSpecularReflectance(vec3 rayDirWS, vec3 normalWS, float roughness)
+{
+    float rayDotNormal = max(0.001, dot(normalWS, -rayDirWS));
+    float f0Water = ((kWaterIoR - 1.0) * (kWaterIoR - 1.0)) / ((kWaterIoR + 1.0) * (kWaterIoR + 1.0));
+
+    return roughFresnel(f0Water, rayDotNormal, roughness);
+}
+
+#define ITER_SHADOW 32u
+float marchShadow(vec3 ro, vec3 rd)
+{
+ 	float d;
+    float sd = 1.0;
+    
+    float transmittance = 1.0;
+    float t = 0.01;
+    
+    for(uint i = NON_CONST_ZERO_U; i < ITER_SHADOW; ++i)
+    {
+        vec3 posWS = ro + rd*t;
+        float foamAmount = 0.0, taaStrength = 0.0;
+        uint materialId = 999u;
+        d = fSDF(posWS, kFoamPartId | kWaveFoamPartId | kRockPartId, materialId, 
+                 foamAmount, taaStrength);
+        d -= t * 0.001;
+        
+        float stepD = max(0.02+float(i)*0.05, abs(d));
+        
+        float stepTransmittance = 1.0;
+        if(materialId == kFoamMatId)
+        {
+            stepTransmittance = exp(-2.0*stepD*foamAmount);
+        }
+        else
+        {
+            stepTransmittance = 0.0;
+        }
+        
+        float coneWidth = max(0.05, t * 1.0/40.0);
+        stepTransmittance = mix(stepTransmittance, 1.0, saturate(d/coneWidth));
+        transmittance *= stepTransmittance;
+        
+        t += stepD;
+        
+        if(transmittance < 0.05)
+        {
+            break;
+        }
+    }
+      
+    return transmittance;
+}
+
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////////// Sun and Sky /////////////////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+
+const vec3 kDirToSunWS = normalize(vec3(0.3, 0.02, 0.5));
+const vec3 kSunColour = vec3(1.0, 0.25, 0.025) * 7.0;
+
+const float kSunAngularRadius = 0.5/180.0*PI;
+const float kSunAngularRadiusCos = cos(kSunAngularRadius);
+
+float sampleCloudNoise(vec2 cloudUV)
+{
+    vec3 cloudWind = -s_time * kTimeScale * 0.001 * oz.xxy;
+    vec3 cloudDetailWind = s_time * kTimeScale * 0.001 * oz.yxy;
+    vec3 uv = vec3(cloudUV * 2.0, 16.5/32.0);
+    return (  1.000*textureLod(iChannel1, uv*0.01 + cloudWind * 0.01, 0.0 ).r 
+            + 0.500*textureLod(iChannel1, uv*0.03 + cloudWind * 0.50, 0.0 ).r
+            + 0.250*textureLod(iChannel1, uv*0.07 + cloudWind * 3.00, 0.0 ).r
+            + 0.125*textureLod(iChannel1, uv*0.25 + cloudDetailWind * 15.0, 0.0 ).r
+            ) * 0.75 - (0.3 * (1.0 - saturate(dot(cloudUV, cloudUV) / 7.0)));
+}
+
+vec3 computeSunColour(float rayDotSun, float roughness)
+{
+    float sqBlur = roughness;
+    float blur = roughness*roughness;
+    float sharpness = 1.0 - blur;
+    
+    float sun = linearstep(kSunAngularRadiusCos - 0.00025 - blur*0.5, kSunAngularRadiusCos + blur*0.25, rayDotSun);
+    vec3 sunColour = safePow(sun, 2.0 + sqBlur * 20.0) * sharpness * 100.0 * kSunColour;
+    return sunColour;
+}
+
+//The sky rendering has built-in roughness/bluring. 
+//It's like an eyeballed mathematical blur integration for doing rough specular lighting
+vec3 computeSkyColour(vec3 rayDirWS, float roughness, bool doClouds, bool doSun, bool doFlares)
+{
+    float sqBlur = roughness;
+    float blur = roughness*roughness;
+    
+    float sharpness = (1.0 - blur);
+
+    float rayDotSun = dot(kDirToSunWS, rayDirWS);
+    float bloom = henyeyGreensteinPhase(rayDotSun, 0.65 - blur * 0.64)*0.65;
+    
+    vec3 sunColour = computeSunColour(rayDotSun, roughness);
+
+    sunColour *= doSun ? 1.0 : 0.0;
+    
+    vec3 sunAndBloom = sunColour + bloom * vec3(1.0, 0.6, 0.2) * min(1.0, 1.0 - rayDirWS.y) * 2.5;
+    
+    //Blend the top, middle and bottom colours
+    vec3 skyTopColour = vec3(0.05, 0.15, 0.5);
+    vec3 skyMidColour = vec3(0.05, 0.8, 1.0);
+    vec3 skyBottomColour = mix(vec3(1.0, 0.2, 0.1), vec3(1.0, 0.3, 0.05), saturate(rayDotSun+0.6));
+    
+    float midToTop = mix(min(0.5, pow(max(0.0001, rayDirWS.y), 0.8)), 0.1, blur*0.75);
+    float bottomToMid = saturate(mix(pow(max(0.0001, rayDirWS.y*1.5 + 0.15), 0.8), 0.5, blur*0.8));
+    vec3 skyColour = mix(skyMidColour, skyTopColour, midToTop);
+    skyColour = mix(skyBottomColour, skyColour, bottomToMid);
+    //Darken the sky at the top
+    skyColour *= mix(0.5 + 0.5*saturate(1.0 - rayDirWS.y), 1.0, blur);
+    
+    
+    if(doClouds)
+    {
+        vec2 cloudUV = rayDirWS.xz/max(0.0001, rayDirWS.y);
+
+        float cloudNoise = sampleCloudNoise(cloudUV);
+        
+        float cloudPhase = (0.2 + henyeyGreensteinPhase(rayDotSun, 0.8 - blur * 0.5)
+              + henyeyGreensteinPhase(rayDotSun, 0.4 - blur * 0.3)) * 4.0 * PI;
+        //High clouds
+        float highCloud = sampleCloudNoise(cloudUV*vec2(6.0, 1.5) + oz.xx*0.79);
+        highCloud = max(0.0, highCloud*highCloud - 0.05)*0.1;
+        vec3 highCloudColour = sharpness*sharpness*highCloud * kSunColour * cloudPhase;
+        
+        //Low clouds
+        float cloudSunTransmittance = linearstep(1.0 + blur*4.0, 0.4 - blur*4.0, 
+                                                 sampleCloudNoise(cloudUV + kDirToSunWS.xz * 1.0));
+		cloudSunTransmittance *= cloudSunTransmittance;
+        
+        float oneMinusTransmittance = saturate(1.0 - cloudNoise);
+        
+        float cloudNoiseStart = 0.6 - blur*4.0;
+        float cloudNoiseEnd = 0.8 + blur*4.0;
+        float cloud = smoothstep(cloudNoiseStart, cloudNoiseEnd, cloudNoise);
+        vec3 cloudColour = skyColour * 0.3;
+        vec3 cloudSun = cloudSunTransmittance * kSunColour * cloudPhase * oneMinusTransmittance;
+        cloudColour += cloudSun;
+        
+        cloudColour += highCloudColour*(1.0 - cloud);
+        cloud = (1.0 - (1.0 - cloud)*(1.0 - highCloud));
+        float atm = linearstep(0.0, 0.15 + blur * 0.5, rayDirWS.y);
+        cloud *= atm;
+        cloud *= sharpness;
+        
+        skyColour += sunAndBloom * max(1.0 - cloud*1.3, oneMinusTransmittance*cloudSunTransmittance);
+        
+        skyColour = mix(skyColour, cloudColour, 0.2*cloud);
+    }
+    else
+    {
+        skyColour += sunAndBloom;
+    }
+    
+    //Flare, completly made up math...
+    //Also, I render them directly in the sky for convenience.
+    //Because of that, they get occluded... sucks, but otherwise 
+    //we would need to compute an extra sun occlusion per pixel (too expensive).
+    vec3 dSun = rayDirWS - kDirToSunWS;
+    float flare = abs(0.5 - fract(atan(length(dSun.xz), dSun.y)*2.0));
+    float flareEnd = 1.0 - s_flare;
+    float flareBloom = linearstep(0.995, 0.99995, rayDotSun);
+    flare = (max(0.0, flare - safePow(flareEnd, 1.0/4.0))*3.0
+        + flareBloom*flareBloom*flareBloom)*0.4*max(0.0, rayDotSun);
+    
+    flare = doFlares ? flare : 0.0;
+    
+	skyColour += flare*flare*kSunColour*3.0;
+    
+    //Below the horizon, blend to a colour similar to what the ocean surface looks like.
+    //This is do allow falling back to a sky sample for refraction and still have things
+    //look okay
+    vec3 approximatedOceanColour = mix(skyBottomColour, skyMidColour*0.7, max(0.0001, -rayDirWS.y*0.7));
+    vec3 approximatedIslandColour = vec3(0.4, 0.25, 0.1) * 
+        (kSunColour*kDirToSunWS.y + 
+         mix(skyTopColour, skyBottomColour, 0.6)/4.0);
+    skyColour = mix(skyColour, approximatedOceanColour, 
+                    min(0.4, smoothstep(-0.01 + blur * 0.5, -0.1 - blur*2.0, rayDirWS.y)));
+    
+	return skyColour;
+}
+
+vec3 computeSkyColour(vec3 rayDirWS, float blur)
+{
+    return computeSkyColour(rayDirWS, blur, true, true, false);
+}
+
+vec3 computeSkyColour(vec3 rayDirWS)
+{
+    return computeSkyColour(rayDirWS, 0.0, true, true, true);
+}
+
+vec3 computeSkyFadeColour(vec3 rayDirWS)
+{
+    return computeSkyColour(rayDirWS, 0.0, false, false, false);
+}
+
+vec3 computeAmbientColour()
+{
+    vec3 skyTopColour = vec3(0.005, 0.025, 1.0);
+    vec3 skyMidColour = vec3(0.1, 0.7, 0.9);
+    vec3 skyBottomColour = vec3(1.0, 0.3, 0.05);
+    return  skyTopColour*0.05 + skyMidColour*0.45 + skyBottomColour*0.5;
+}
+
+float computeSkyTransmittance(float dist, vec3 rayOriginWS, vec3 rayDirWS)
+{
+    vec3 hitPosWS = rayOriginWS + dist * rayDirWS;
+    float heightFog = 1.0 - exp(-hitPosWS.y*0.1);
+    float transmittance = exp(-dist * 0.006 * (1.0 - heightFog*0.9));
+    return min(1.0, transmittance + 0.07);
+}
+
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+//////////////// Underwater inscatter/transmittance /////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+
+
+void computeFoamInscatterTransmittance(vec3 rayDirWS, float stepDistance, float foamAmount,
+                                       float hgPhase, float msPhase, vec3 ambient, float shadow,
+                                       out vec3 foamInscatter, out float foamTransmittance)
+{
+    float foamExtinctionCoef = 2.0*foamAmount;
+    foamTransmittance = exp(-0.2*foamExtinctionCoef*stepDistance);
+
+    vec3 sunLighting = (msPhase + hgPhase*1.5)
+        * kSunColour * shadow;
+    foamInscatter = min(1.0, foamExtinctionCoef*stepDistance) * 0.5*(sunLighting + ambient);
+}
+
+const vec3 kCleanWaterAbsorptionCoeffs = vec3(0.65, 0.064, 0.015) * 6.0;  // x10 for ocean, x50 for turbid
+const vec3 kCleanWaterSSAlbedo         = vec3(0.001, 0.025, 0.4)*1.0;
+
+void computeWaterInscatterTransmittance(vec3 rayDirWS, float stepDistance, float foamAmount,
+                                        out vec3 inscatter, out vec3 transmittance)
+{
+    float hgPhase = henyeyGreensteinPhase(dot(rayDirWS, kDirToSunWS), 0.75);
+
+    transmittance = exp(-kCleanWaterAbsorptionCoeffs * stepDistance);
+    vec3 sunLighting = (saturate(stepDistance * 0.1) + hgPhase/kIsotropicScatteringPhase)
+        * kSunColour;
+    
+    vec3 ambient = computeAmbientColour();
+    inscatter = (oz.xxx - transmittance ) * (sunLighting + ambient) * kCleanWaterSSAlbedo;   
+    
+    //Add some foam
+	float foamTransmittance = 1.0;
+    vec3 foamInscatter = oz.yyy;
+    float foamStepD = min(0.3, stepDistance);
+    computeFoamInscatterTransmittance(rayDirWS, foamStepD, foamAmount, 
+                                      henyeyGreensteinPhase(dot(rayDirWS, kDirToSunWS), 0.5), 0.5,
+                                      ambient, 0.7, foamInscatter, foamTransmittance);
+    
+    //Colour the foam
+    float foamDepth = (1.0 - foamAmount);
+    foamDepth *= 4.0 * foamDepth;
+	vec3 waterTransmittance = exp(-kCleanWaterAbsorptionCoeffs * foamStepD * foamDepth);
+    vec3 waterInstatter = (oz.xxx - waterTransmittance ) 
+        * (sunLighting + ambient) * kCleanWaterSSAlbedo;   
+    
+    foamInscatter = foamInscatter * waterTransmittance + waterInstatter*foamAmount;
+    
+    inscatter *= foamTransmittance;
+    transmittance *= foamTransmittance;
+    inscatter += foamInscatter;    
+}
+
+
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+//////////////////////////// Lighting ///////////////////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+
+vec3 doLighting(vec3 posWS, vec3 rayDirWS, uint materialId, float distUnderWater)
+{
+    vec3 originalPosWS = posWS; //Need to use that for anything that calls fSDF because the rotation is applied internally
+    posWS = computeWalkRotatedPosWS(posWS, s_time);
+    
+    vec3 albedo = oz.yyy;
+    float roughness = 0.0;
+	
+    uint partSelection = 0u;
+    float normalSamplingDT = 0.0;
+    float shadowRayStartOffset = 0.02;
+    vec3 normalOffset = oz.yyy;
+    
+    if(materialId == kSandMatId)
+    {
+        partSelection = kIslandPartId;
+        
+    	vec3 sandNoise = textureLod(iChannel2, posWS.xz*0.25, 0.0).rgb - 0.5*oz.xxx;
+
+        float waterFbm = computeWaterFbm(posWS, originalPosWS, 0.0);
+        float waterHighLine = 0.25 + kWaterFbmAmount * waterFbm;
+        float waterDistDelayed0 = fBeachWaterDist(originalPosWS - oz.yxy * 0.01, s_time - 0.2, waterFbm);
+
+        float wetness = saturate((-waterDistDelayed0)*10.0 + 1.0);
+        wetness = max(wetness, step(0.01, distUnderWater));
+        wetness = max(wetness, smoothstep(waterHighLine + 0.15, waterHighLine - 0.25, posWS.y));
+		
+        wetness = safePow(wetness, 1.0 / 2.0);
+        float normalNoiseAmount = saturate(0.25*(1.0 - wetness*wetness) + 0.05);
+        normalNoiseAmount *= linearstep(0.05, 0.0, distUnderWater);
+        
+        albedo = vec3(0.5, 0.35, 0.15);
+        albedo *= 1.0 - sandNoise.r*0.25;
+
+        float rocks = 0.0;
+		float rockStrength = getPebbleDisp(posWS, originalPosWS, rocks);
+        
+        albedo = mix(albedo, (1.0 - wetness*0.35) * oz.xxx, rockStrength);
+        normalNoiseAmount *= (1.0 - rockStrength);
+        
+        albedo = safePow(albedo, vec3(1.0 + wetness));
+        albedo *= (1.0 - wetness * 0.05);
+   
+        albedo *= 0.7;
+        
+        
+        normalOffset = (sandNoise)*normalNoiseAmount*0.5; 
+        
+        roughness = min(1.0, 0.1 + (sandNoise.r * 0.1 + 0.7)*smoothstep(1.0, 0.75, wetness));
+        normalSamplingDT = mix(0.05, 0.01, saturate((rocks - 0.4)/0.5));
+    }
+    else if(materialId == kRockMatId)
+    {
+        partSelection = kRockPartId;
+        albedo = vec3(0.5, 0.45, 0.35)*0.6;
+        roughness = 0.8;
+        float rockFbm = rockFbm(posWS*4.0 + oz.xxx * 10.0);
+        
+        float blendToMoss = linearstep(0.42, 0.68, rockFbm - (posWS.y - 1.0)*0.015);
+		albedo = mix(albedo, vec3(0.05, 0.2, 0.1)*0.65, blendToMoss);
+        
+        albedo *= 0.2 + 0.8*linearstep(0.2, 0.6, rockFbm);
+        
+        albedo *= 0.7;
+        
+        roughness = min(1.0, roughness + (rockFbm - 0.5) * 0.5);
+            
+        normalSamplingDT = 0.1;
+        shadowRayStartOffset = 0.2;
+    }
+    else if(materialId == kFoamMatId)
+    {
+        partSelection = kFoamPartId | kWaveFoamPartId;
+        roughness = 0.1;
+        albedo = oz.yyy;
+        normalSamplingDT = 0.05;
+    }
+    else if(materialId == kBirdsMatId)
+    {
+        partSelection = kBirdsPartId;
+        float wingTips = 0.0;
+        fBirds(originalPosWS, wingTips);
+        albedo = mix(oz.xxx * 0.5, oz.xxx * 0.1, wingTips);
+        albedo = mix(oz.xxx * 0.8, albedo, min(1.0, wingTips * 5.0));
+        roughness = 0.7;
+        normalSamplingDT = 0.05;
+    }
+    
+    vec3 normalWS = computeNormalForPart(originalPosWS, partSelection, normalSamplingDT);
+    normalWS = normalize(normalWS + normalOffset);
+    
+    float sunModulation = marchShadow(originalPosWS + normalWS * shadowRayStartOffset, kDirToSunWS);
+    
+    vec3 reflectionDirWS = reflect(rayDirWS, normalWS);
+    
+    vec3 ambientColour = computeSkyColour(normalize(normalWS + reflectionDirWS), 1.0);
+	vec3 dirToSunWS = kDirToSunWS;
+	vec3 sunColour = kSunColour;
+    
+#if 1
+    if(distUnderWater > 0.01)
+    {
+        float refractionStrength = saturate(distUnderWater * 1.0 - 0.15)* linearstep(5.0, 1.0, distUnderWater);;
+        
+        //Refract the reflection dir by an imgaginary horizontal water plane
+        vec3 refractedReflectionDirWS = -refract(-reflectionDirWS, oz.yxy, 1.0/kWaterIoR);
+        
+        //Refract the light coming from the sun by an imgaginary horizontal water plane
+        vec3 refractedDirToSunWS = -refract(-kDirToSunWS, oz.yxy, 1.0/kWaterIoR);
+    	float waterPlaneT = max(0.0, -(originalPosWS.y-distUnderWater)/max(0.0001, refractedDirToSunWS.y));
+    	
+        vec3 waterSurfaceNormalWS = computeWaterPlaneNormal(originalPosWS + refractedDirToSunWS * waterPlaneT, 0.1);
+        
+        sunColour *= exp(-waterPlaneT * kCleanWaterAbsorptionCoeffs * refractionStrength);
+
+        float caustics = sunModulation*40.0*linearstep(0.0, 0.2, refractionStrength)*
+            pow(max(0.0001, dot(waterSurfaceNormalWS, refractedDirToSunWS)), 8.0);
+        sunModulation = max(sunModulation, caustics);
+        
+        //blend 
+        dirToSunWS = normalize(mix(kDirToSunWS, refractedDirToSunWS, refractionStrength));
+        reflectionDirWS = normalize(mix(reflectionDirWS, refractedReflectionDirWS, refractionStrength));
+    }    
+#endif    
+    
+    float nDotL = dot(normalWS, dirToSunWS);
+    float vDotL = dot(dirToSunWS, rayDirWS);
+	float nDotV = dot(normalWS, -rayDirWS);
+    
+    
+    float fresnelReflectance = roughFresnel(0.04, max(0.0001, nDotV), roughness);
+    vec3 lighting = oz.yyy;
+    vec3 diffuseLighting = oz.yyy;
+    
+    if(materialId == kFoamMatId)
+    {
+        float normalBasedSunModulation = smoothstep(-1.0, 0.5, nDotL);
+        float hgPhase = henyeyGreensteinPhase(dot(rayDirWS, dirToSunWS), 0.5);
+        float msPhase = 0.6*smoothstep(-0.5, 0.3, nDotL) * smoothstep(-0.5, 1.0, nDotV);
+        sunModulation = min(normalBasedSunModulation, sunModulation);
+
+        float foamTransmittance;
+        vec3 foamInscatter;
+        float foamStepD = 10.0;
+        computeFoamInscatterTransmittance(rayDirWS, foamStepD, 1.0, hgPhase, msPhase,
+                                          ambientColour, sunModulation,
+                                          foamInscatter, foamTransmittance);
+
+        //If the ray goes down, it should hit the water plane
+        //Our reflections can't handle that, so fallbackk to diffuse lighting
+        fresnelReflectance *= linearstep(-0.3, 0.2, reflectionDirWS.y);
+
+        diffuseLighting = foamInscatter;
+    }     
+    else if(materialId == kSandMatId)
+    {
+        //Diffuse with light leaking through the sand
+        diffuseLighting = albedo *
+            (smoothstep(-0.2, 1.0, nDotL) * sunColour * sunModulation + ambientColour);
+    }
+    else
+    {
+        //Lambertian diffuse
+        diffuseLighting = albedo *
+            (max(0.0, nDotL) * sunColour * sunModulation + ambientColour);
+    }
+    
+    vec3 specularSky = computeSkyColour(reflectionDirWS, roughness, true, false, false);
+    vec3 specularSun = computeSunColour(dot(reflectionDirWS, dirToSunWS), roughness);
+    vec3 specularReflection = specularSky + specularSun * sunModulation;
+
+    lighting = mix(diffuseLighting, specularReflection, fresnelReflectance);
+
+    return lighting;
+}
+
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+////////////////////////// Ray marching /////////////////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+
+float findSdfIntersectionDist(vec3 rayOriginWS, vec3 rayDirWS, inout uint numSteps,
+                             out uint matId, out float foamAmount, out float taaStrength)
+{    
+    vec3 posWS = rayOriginWS;
+    
+    matId = 999u;
+    foamAmount = 0.0;
+    taaStrength = 1.0;
+    
+    float maxT = kMaxDist;
+    
+    //No point in raymarching too high, so compute a maximum distance
+    float topPlaneD = (25.0 - rayOriginWS.y)/max(0.0001, rayDirWS.y);
+    if(topPlaneD > 0.0)
+    {
+        maxT = min(topPlaneD, maxT);
+    }
+    
+    float t = 0.0;
+    
+ 	float d;
+    for(;numSteps > 0u; --numSteps)
+    {
+        d = fSDF(posWS, 0xffffffffu,
+                 /*outs*/matId, foamAmount, taaStrength);
+        
+        float coneWidth = t * 0.0015;
+        float stepD = max(kStepEpsilon + coneWidth, d);
+        
+        posWS += rayDirWS * stepD;
+        
+        if(t >= maxT)
+        {
+			break;
+        }
+
+        if((d) < (kDistanceEpsilon + coneWidth))
+        {
+			t = max(0.0, t + d);
+            return t;
+        }
+        
+        t += stepD;
+    }
+	
+    //If we run out of steps intersect with water plane
+    
+    float cosDirY = abs(rayDirWS.y) < 0.00001 ? 0.0001 : rayDirWS.y;
+    foamAmount = 0.0;
+    taaStrength = 1.0;
+    return rayOriginWS.y/-cosDirY;
+}
+
+#define ITER 256u
+vec3 march(vec3 rayOriginWS, vec3 rayDirWS, 
+           out float outTaaStrength, out float outIntersectDist)
+{   
+    outTaaStrength = 1.0;
+    outIntersectDist = kMaxDist;
+    
+    vec3 eyePosWS = rayOriginWS;
+    vec3 finalLighting = oz.yyy;
+    vec3 remainingLight = oz.xxx;
+    
+    uint remainingSteps = ITER;
+    
+    float roughness = -1.0;
+    
+    for(uint bounce = NON_CONST_ZERO_U; bounce < 2u; ++bounce)
+    {
+        uint matId = 999u;
+        float foamAmount = 0.0, taaStrength = 1.0;
+        float intersectT = findSdfIntersectionDist(rayOriginWS, rayDirWS, remainingSteps,
+                                                   matId, foamAmount, taaStrength);
+        
+        if(intersectT > 0.0)
+        {
+            vec3 hitPosWS = rayOriginWS + rayDirWS * intersectT;
+
+            outTaaStrength = bounce == 0u ? taaStrength : outTaaStrength;
+            outIntersectDist = bounce == 0u ? intersectT : outIntersectDist;
+            
+			if(matId == kWaterMatId)
+            {
+                vec3 normalWS = computeNormalForPart(hitPosWS, kWaterPartId, 0.025);
+                //On thin wave parts, we can get backfacing normals
+                normalWS = fixNormalBackfacingness(normalWS, rayDirWS);
+                
+                roughness = computeWaterRoughness(hitPosWS - eyePosWS);
+
+                //We just hit water, refract the ray and add the relfection
+                float fresnelReflectance = 
+                  computeWaterSpecularReflectance(rayDirWS, normalWS, roughness);
+                vec3 refractedDirWS = refract(rayDirWS, normalWS, 1.0 / 1.33);
+                vec3 reflectedDirWS = reflect(rayDirWS, normalWS);
+     
+                float refractedRayDotNormal = max(0.01, dot(normalWS, -refractedDirWS));
+                float thickness = (0.05 + linearstep(1.5, 0.0, hitPosWS.y))/refractedRayDotNormal;
+              
+                vec3 refractedLight = oz.yyy;
+                //Apply refracted light
+                float islandIntersectT = sphIntersect(hitPosWS + oz.yxy * 0.05, refractedDirWS, kIslandSphereCenterWS,
+                                                kIslandSphereRadius).x;
+                
+                thickness = min(thickness, islandIntersectT > 0.0 ? islandIntersectT : 99999.0);
+                
+                vec3 refractedSkyColour = computeSkyColour(refractedDirWS, 0.0);
+                if(islandIntersectT > 0.0)
+                {
+                    vec3 refractedHitPos = hitPosWS + refractedDirWS * islandIntersectT;
+                    
+                    refractedLight = doLighting(refractedHitPos, refractedDirWS, kSandMatId, islandIntersectT);
+                    //No sky fade, we have water transmittance
+                    
+                    refractedLight = mix(refractedSkyColour, refractedLight, 
+                                         exp(-islandIntersectT*0.1));
+                }
+                else
+                {
+                    refractedLight = refractedSkyColour;
+                }
+
+                vec3 waterInscatter = oz.yyy, waterTransmittance = oz.xxx;
+#if 1                
+                computeWaterInscatterTransmittance(refractedDirWS, max(0.0, thickness - 0.2), foamAmount,
+                                                   waterInscatter, waterTransmittance);
+#endif                
+
+                finalLighting += remainingLight * (1.0 - fresnelReflectance)*(waterInscatter + 
+                    waterTransmittance * refractedLight);
+                
+                float skyFade = computeSkyTransmittance(intersectT, rayOriginWS, rayDirWS);
+                vec3 skyFadeColour = computeSkyFadeColour(rayDirWS);
+                
+                finalLighting = finalLighting * skyFade  + 
+                    remainingLight * skyFadeColour * (1.0 - skyFade);
+
+                remainingLight *= fresnelReflectance;
+                remainingLight *= skyFade;
+                
+                rayDirWS = reflectedDirWS;
+
+                rayOriginWS = hitPosWS + normalWS * 0.1;
+
+                //Skip the reflection ray in the distance
+                if(intersectT > 150.0)
+                {
+                    break;
+                }
+            }
+            else
+            {               
+                vec3 skyColour = computeSkyFadeColour(rayDirWS);
+    			vec3 sceneColour = skyColour;
+
+                float skyFade = computeSkyTransmittance(intersectT, rayOriginWS, rayDirWS);
+                sceneColour = doLighting(hitPosWS, rayDirWS, matId, 0.0);
+                sceneColour = mix(skyColour, sceneColour, skyFade);
+                
+                finalLighting = finalLighting + remainingLight*sceneColour;
+                remainingLight = oz.yyy;
+                
+                break;
+            }
+        }
+        else
+        {
+            break;
+        }
+    }
+
+
+	vec3 skyColour = roughness >= 0.0 ? computeSkyColour(rayDirWS, roughness)
+        : computeSkyColour(rayDirWS);
+    
+    return finalLighting + remainingLight*skyColour;
+}
+
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+//////////////////////////// Cameras ////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
+
+vec2 getScreenspaceUvFromRayDirectionWS(
+    vec3 rayDirectionWS,
+	vec3 cameraForwardWS,
+	vec3 cameraUpWS,
+	vec3 cameraRightWS,
+	float aspectRatio)
+{
+    vec3 eyeToCameraPlaneCenterWS = cameraForwardWS * kCameraPlaneDist;
+    // project rayDirectionWs onto camera forward
+    float projDist                 = dot(rayDirectionWS, cameraForwardWS);
+    vec3  eyeToPosOnCameraPlaneWS = rayDirectionWS / projDist * kCameraPlaneDist;
+    vec3  vecFromPlaneCenterWS       = eyeToPosOnCameraPlaneWS - eyeToCameraPlaneCenterWS;
+
+    float xDist = dot(vecFromPlaneCenterWS, cameraRightWS);
+    float yDist = dot(vecFromPlaneCenterWS, cameraUpWS);
+
+    xDist /= aspectRatio;
+    xDist = xDist * 0.5 + 0.5;
+    yDist = yDist * 0.5 + 0.5;
+
+    return vec2(xDist, yDist);
+}
+
+void computeCamera(float time, vec2 mouseNorm,
+                   out vec3 rayOriginWS,
+                   out vec3 cameraForwardWS,
+                   out vec3 cameraUpWS,
+                   out vec3 cameraRightWS
+                  )
+{
+#if BIRDS_EYE_VIEW  
+    float flyTime = time * kTimeScale * 0.1;
+    //walk head bob
+    float headBodUp = sin(flyTime * PI);
+    float headBobSide = cos(flyTime * 0.5 * PI);
+    
+    float dy = cos(flyTime * PI);
+    float dx = -sin(flyTime * PI * 0.5) * 4.0;
+    
+    float flapping = max(0.0, dy);
+    headBodUp += sin(time*11.0)*0.1*flapping*flapping;
+    
+	rayOriginWS = vec3( -1.0 + headBobSide * 4.0, 2.2 + headBodUp * 1.0, -40.0 );    
+#else
+    float walkTime = time * 1.5 * kTimeScale;
+    //walk head bob
+    float headBodUp = sin(walkTime*PI);
+    float headBobSide = cos(walkTime*0.5*PI);
+    
+    float dy = cos(walkTime * PI) * 0.025 * 0.5;
+    float dx = -sin(walkTime * PI * 0.5) * 0.05 * 0.5;
+    
+	rayOriginWS = vec3( -4.0 + headBobSide * 0.05, 1.8 + headBodUp * 0.025, -50.0 );
+#endif
+    
+    cameraForwardWS = normalize(vec3(dx, dy, kWalkRotationTimeScale * 2.0));
+    pR(cameraForwardWS.yz, mouseNorm.y * 0.25*PI);
+    pR(cameraForwardWS.xz, mouseNorm.x * PI);
+    cameraRightWS = normalize(cross(oz.yxy, cameraForwardWS));
+    cameraUpWS = normalize(cross(cameraForwardWS, cameraRightWS));
+    
+    rayOriginWS -= cameraForwardWS*kCameraPlaneDist*0.5;    
+}
+
+#define TAA 1
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    float jitterAmount = step(iMouse.z, 0.01) * float(TAA);
+    
+    vec4 blueNoise = textureLod(iChannel2, fragCoord.xy/1024.0, 0.0).rgba;
+    vec2 subPixelJitter = fract(blueNoise.xz + float(iFrame%256) * kGoldenRatio * oz.xx) - 0.5*oz.xx;
+    
+	vec2 uv = (fragCoord.xy + jitterAmount * subPixelJitter*0.5) / iResolution.xy;
+    
+    float aspectRatio = iResolution.x/iResolution.y;
+    vec2 uvNorm = uv * 2.0 - vec2(1.0);
+    uvNorm.x *= aspectRatio;
+    
+    vec2 mouseUNorm = iMouse.xy/iResolution.xy;
+    //Make sure the default (0, 0) mouse looks nice and centered
+    if(length(iMouse.xy) < 30.0 && iMouse.z < 1.0) 
+    {
+        mouseUNorm = oz.xx*0.5;
+    }
+    vec2 mouseNorm = mouseUNorm*2.0 - vec2(1.0);
+
+    s_time = iTime - blueNoise.z * min(0.033, iTimeDelta);
+    
+    float prevTime = (s_time - iTimeDelta); 
+    
+    
+    // ---- Camera setup ---- //
+    vec3 cameraForwardWS, cameraUpWS, cameraRightWS;
+    computeCamera(s_time, mouseNorm, s_eyePosWS, cameraForwardWS, cameraUpWS, cameraRightWS);
+    
+    s_pixelSpacingAtUnitLengthWS = (2.0 / kCameraPlaneDist) / iResolution.y;
+    
+    vec3 eyeToPosOnCameraPlaneWS = cameraForwardWS*kCameraPlaneDist + cameraRightWS*uvNorm.x
+        + uvNorm.y * cameraUpWS;
+     
+    vec3 rayDirWS = normalize(eyeToPosOnCameraPlaneWS);    
+    
+    // ---- Lens flare ---- //
+	//Some weird idea about how lens flares are refracted light of a curved lens
+    //led to this. Almost definitively wrong, but gives interesting results.
+    float curvature = 1.0 - length(uvNorm)/aspectRatio;
+    vec3 lensNormal = normalize(rayDirWS*0.5 + cameraForwardWS*curvature);
+    vec3 refractedSunLight = refract(-kDirToSunWS, lensNormal, 1.0/1.8);
+    float flare = linearstep(0.9, 0.99995, dot(-refractedSunLight, rayDirWS));
+    s_flare = flare;
+    
+    // ---- Ray march ---- //
+    float intersectDist = kMaxDist;
+    float thisFrameTaaStrength = 0.0;
+    vec3 sceneColour = march(s_eyePosWS, rayDirWS, thisFrameTaaStrength, intersectDist);
+    
+    // ---- Reprojection ----//
+    //Compute the prev camera data
+    vec3 prevCameraPosWS, prevCameraForwardWS, prevCameraUpWS, prevCameraRightWS;
+    computeCamera(prevTime, mouseNorm, prevCameraPosWS, 
+                  prevCameraForwardWS, prevCameraUpWS, prevCameraRightWS);
+    
+    vec3 currentRefPosWS = s_eyePosWS + rayDirWS * intersectDist;
+    currentRefPosWS = computeWalkRotatedPosWS(currentRefPosWS, iTimeDelta);
+    vec3 prevCameraRayDirWS = normalize(currentRefPosWS - prevCameraPosWS);
+    
+    //And work back to get the prev frame uv
+    vec2 prevFrameUv = getScreenspaceUvFromRayDirectionWS(prevCameraRayDirWS,
+    	prevCameraForwardWS, prevCameraUpWS, prevCameraRightWS, aspectRatio);
+    prevFrameUv = (prevFrameUv * iResolution.xy - jitterAmount * subPixelJitter) / iResolution.xy;
+    
+	sceneColour = min(2.0*oz.xxx, sceneColour); //Clamp to prevent noisy sun highlights
+    
+#if TAA
+    float taaStrength = thisFrameTaaStrength;
+    vec4 prevData = textureLod(iChannel0, prevFrameUv, 0.0);
+	
+    vec3 prevColour = prevData.rgb;
+    float prevTaaStrength = prevData.a;
+    
+    float blendToCurrent = mix(1.0, 1.0/8.0, taaStrength);
+    taaStrength = mix(prevTaaStrength, taaStrength, blendToCurrent);
+    blendToCurrent = mix(0.85, 1.0/8.0, taaStrength);
+    
+    vec2 outOfPrevTexture = max(oz.yy, abs(prevFrameUv-0.5*oz.xx) - 0.5*oz.xx);
+	blendToCurrent = min(1.0, blendToCurrent + max(outOfPrevTexture.x, outOfPrevTexture.y) * 100.0);
+    
+    if(iMouse.z > 0.001)
+    {
+        blendToCurrent = 0.5;
+    }
+    
+    sceneColour = mix(prevColour, sceneColour, blendToCurrent);
+    
+    
+    fragColor.rgb = sceneColour;
+    fragColor.a = intersectDist;
+    fragColor.a = taaStrength;
+    
+#else
+    fragColor.rgb = sceneColour;
+#endif    
+}
