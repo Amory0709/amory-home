@@ -1,0 +1,37 @@
+// STORES CURRENT CAMERA ROTATION (so we don't get that awkward jump when mouse button held/released)
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    // init buffer
+    if(iFrame == 0) {
+        fragColor = vec4(baseCamMove, 0, 0);
+        return;
+    }
+    
+    ivec2 fc = ivec2(fragCoord);
+    if(fc == T_MOUSE_ROT) {
+        vec4 data = texelFetch(iChannel0, T_MOUSE_ROT, 0);
+        float rot = data.x;
+        float camY = data.y;
+        vec2 mp = data.zw;
+        bool wasHeld = mp.x >= 0.;
+        bool isHeld = iMouse.z > 0.;
+        vec2 mpNew = iMouse.xy / iResolution.y; // normalized mouse pos
+        
+        // LMB held?
+        if(isHeld && wasHeld) {
+            vec2 delta = mpNew - mp;
+            rot -= delta.x * camRotSpeed;;
+            camY -= delta.y * camYSpeed;
+        }
+        else {
+            rot += autoRotSpeed * iTimeDelta;
+        }
+        mp = isHeld ? mpNew : vec2(-1); // store negative val if not held, so we can detect that status on the next frame
+        
+        // limit
+        camY = clamp(camY, minMaxCamY.x, minMaxCamY.y);
+        
+        fragColor = vec4(rot, camY, mp);
+    }
+}
