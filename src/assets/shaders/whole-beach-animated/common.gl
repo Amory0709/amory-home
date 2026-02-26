@@ -1,0 +1,174 @@
+
+#define NON_CONST_ZERO (min(iFrame,0)) 
+#define NON_CONST_ZERO_U uint(min(iFrame,0)) 
+
+#define PI 3.141592
+
+const vec2 oz = vec2(1.0, 0.0);
+
+const float kGoldenRatio = 1.618;
+const float kGoldenRatioConjugate = 0.618;
+
+const float kPI         = 3.14159265359;
+const float kTwoPI      = 2.0 * kPI;
+
+const float kWaterIoR = 1.33;
+
+#define TAU (kTwoPI)
+#define PHI (sqrt(5) * 0.5 + 0.5)
+
+#define saturate(x) clamp(x, 0.0, 1.0)
+
+float kIsotropicScatteringPhase = (1.0 / (4.0 * kPI));
+
+float roughFresnel(float f0, float cosA, float roughness)
+{
+    // Schlick approximation
+    return f0 + (1.0 - f0) * (pow(1.0 - cosA, 5.0)) * (1.0 - roughness);
+}
+
+float fresnel(float f0, float cosA)
+{
+    return roughFresnel(f0, cosA, 0.0);
+}
+
+float linearstep(float start, float end, float x)
+{
+    float range = end - start;
+    return saturate((x - start) / range);
+}
+
+float henyeyGreensteinPhase_schlick(float cosA, float g)
+{
+    float k = 1.55*g - 0.55*g*g*g;
+    float f = 1.0 - k * cosA;
+	return (1.0 - k * k) / (4.0 * kPI * f*f);
+}
+
+float henyeyGreensteinPhase(float cosA, float g)
+{
+    return henyeyGreensteinPhase_schlick(cosA, g);
+	/*float g2 = g*g;
+    return 1.0 / (4.0 * kPI) *
+        ((1.0 - g2)/pow(1.0 + g2 - 2.0*g*cosA, 1.5));*/
+}
+
+float safePow(float v, float p)
+{
+    return pow(max(0.00001, v), p);
+}
+
+vec3 safePow(vec3 v, vec3 p)
+{
+    return pow(max(0.00001*oz.xxx, v), p);
+}
+
+
+//////////////////////////////////////////////////////////////
+//															//
+// SDF functions from mercury : http://mercury.sexy/hg_sdf/ //
+//															//
+//////////////////////////////////////////////////////////////
+
+float fSphere(vec3 p, float r)
+{
+    return length(p) - r;
+}
+
+float fInfiniteCylinder(vec3 p, float r)
+{
+    float d = length(p.xz) - r;
+    return d;
+}
+
+// Capsule: A Cylinder with round caps on both sides
+float fCapsule(vec3 p, float r, float c)
+{
+    return mix(length(p.xz) - r, length(vec3(p.x, abs(p.y) - c, p.z)) - r, step(c, abs(p.y)));
+}
+
+// Torus in the XZ-plane
+float fTorus(vec3 p, float smallRadius, float largeRadius)
+{
+    return length(vec2(length(p.xz) - largeRadius, p.y)) - smallRadius;
+}
+
+// Rotate around a coordinate axis (i.e. in a plane perpendicular to that axis) by angle <a>.
+// Read like this: R(p.xz, a) rotates "x towards z".
+// This is fast if <a> is a compile-time constant and slower (but still practical) if not.
+void pR(inout vec2 p, float a)
+{
+    p = cos(a) * p + sin(a) * vec2(p.y, -p.x);
+}
+
+// Repeat space along one axis. Use like this to repeat along the x axis:
+// <float cell = pMod1(p.x,5);> - using the return value is optional.
+float pMod1(inout float p, float size)
+{
+    float halfsize = size * 0.5;
+    float c        = floor((p + halfsize) / size);
+    p              = mod(p + halfsize, size) - halfsize;
+    return c;
+}
+
+// Repeat in two dimensions
+vec2 pMod2(inout vec2 p, vec2 size)
+{
+    vec2 c = floor((p + size * 0.5) / size);
+    p      = mod(p + size * 0.5, size) - size * 0.5;
+    return c;
+}
+
+// Repeat in three dimensions
+vec3 pMod3(inout vec3 p, vec3 size)
+{
+    vec3 c = floor((p + size * 0.5) / size);
+    p      = mod(p + size * 0.5, size) - size * 0.5;
+    return c;
+}
+
+// The "Round" variant uses a quarter-circle to join the two objects smoothly:
+float fOpUnionRound(float a, float b, float r)
+{
+    vec2 u = max(vec2(r - a, r - b), vec2(0));
+    return max(r, min(a, b)) - length(u);
+}
+
+// Similar to fOpUnionRound, but more lipschitz-y at acute angles
+// (and less so at 90 degrees). Useful when fudging around too much
+// by MediaMolecule, from Alex Evans' siggraph slides
+float fOpUnionSoft(float a, float b, float r)
+{
+    float e = max(r - abs(a - b), 0.0);
+    return min(a, b) - e * e * 0.25 / r;
+}
+
+////////////////////////////////////////////////////
+//////////// Intersectors/SDFs from IQ /////////////
+////////////////////////////////////////////////////
+
+// sphere of size ra centered at point ce
+vec2 sphIntersect( in vec3 ro, in vec3 rd, in vec3 ce, float ra )
+{
+    vec3 oc = ro - ce;
+    float b = dot( oc, rd );
+    float c = dot( oc, oc ) - ra*ra;
+    float h = b*b - c;
+    if( h<0.0 ) return vec2(-1.0); // no intersection
+    h = sqrt( h );
+    return vec2( -b-h, -b+h );
+}
+
+float sdRoundCone( in vec3 p, in float r1, float r2, float h )
+{
+    vec2 q = vec2( length(p.xz), p.y );
+    
+    float b = (r1-r2)/h;
+    float a = sqrt(1.0-b*b);
+    float k = dot(q,vec2(-b,a));
+    
+    if( k < 0.0 ) return length(q) - r1;
+    if( k > a*h ) return length(q-vec2(0.0,h)) - r2;
+        
+    return dot(q, vec2(a,b) ) - r1;
+}
