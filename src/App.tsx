@@ -6,7 +6,7 @@ function App() {
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#000' }}>
       <Canvas
-        camera={{ position: [0, 5, 10], fov: 60 }}
+        camera={{ position: [2.5, 2.5, 2.5], fov: 60 }}
         gl={{ antialias: true }}
       >
         <color attach="background" args={['#87CEEB']} />
