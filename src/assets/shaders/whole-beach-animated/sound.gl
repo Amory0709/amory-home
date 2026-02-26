@@ -1,0 +1,20 @@
+
+vec2 waveNoise(float time)
+{
+    return textureLod(iChannel0, vec2(time, time + kPI * 0.5), 0.0).rg*2.0 - oz.xx;
+}
+
+vec2 mainSound( in int samp, float time )
+{
+    //wave every 10s
+    float repTime = mod(time + 3.4, 10.0);
+    float waveStrength = smoothstep(0.0, 1.5, repTime) - smoothstep(1.5, 5.0, repTime);
+    
+    float waveNoiseTime = time * 1.5;
+    vec2 bluishNoise = waveNoise(waveNoiseTime*0.2) * 0.3;
+    bluishNoise 	+= waveNoise(waveNoiseTime*0.4) * 0.4;
+    bluishNoise 	+= waveNoise(waveNoiseTime*0.8) * 0.3;
+    vec2 waveCrashSound = bluishNoise * 0.3 * (0.05 + waveStrength);
+
+    return waveCrashSound;
+}
