@@ -76,13 +76,13 @@ export class SceneManager {
     private updateCameraUniforms() {
         if (!this.material) return;
 
-        // Stand on the beach, looking out towards the sea
-        const cameraPos = new THREE.Vector3(0, 1.5, -12);
-        const lookAt = new THREE.Vector3(0, 0.2, 0);
+        this.controls.update(); // Required for damping
 
-        const cf = new THREE.Vector3().subVectors(lookAt, cameraPos).normalize();
-        const cr = new THREE.Vector3().crossVectors(cf, new THREE.Vector3(0, 1, 0)).normalize();
-        const cu = new THREE.Vector3().crossVectors(cr, cf).normalize();
+        // Get camera vectors from the virtual camera controlled by OrbitControls
+        const cameraPos = this.virtualCamera.position;
+        const cf = new THREE.Vector3(0, 0, -1).applyQuaternion(this.virtualCamera.quaternion).normalize();
+        const cr = new THREE.Vector3(1, 0, 0).applyQuaternion(this.virtualCamera.quaternion).normalize();
+        const cu = new THREE.Vector3(0, 1, 0).applyQuaternion(this.virtualCamera.quaternion).normalize();
 
         this.material.uniforms.uCameraPos.value.copy(cameraPos);
         this.material.uniforms.uCameraDir.value.copy(cf);
