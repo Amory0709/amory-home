@@ -13,6 +13,7 @@ export const oceanFragmentShader = `
   uniform vec3 uCameraDir;
   uniform vec3 uCameraRight;
   uniform vec3 uCameraUp;
+  uniform sampler2D uDrawingTexture;
   
   varying vec2 vUv;
 
@@ -255,6 +256,19 @@ export const oceanFragmentShader = `
       return pow(fresnel, 6.0);
   }
   
+  vec3 applyDrawing(vec3 col, vec3 gp) {
+      vec2 duv = vec2(
+          (gp.x + 25.0) / 50.0,
+          (gp.z + 20.0) / 30.0
+      );
+      if (duv.x >= 0.0 && duv.x <= 1.0 && duv.y >= 0.0 && duv.y <= 1.0) {
+          vec4 d = texture2D(uDrawingTexture, duv);
+          vec3 deeperSand = col * vec3(0.72, 0.52, 0.58);
+          col = mix(col, deeperSand, d.a * 0.85);
+      }
+      return col;
+  }
+
   vec3 Render(float t, vec3 ro, vec3 rd) {
       // Sky
       if(t < 0.0) {
@@ -297,6 +311,7 @@ export const oceanFragmentShader = `
           
           float wetness;
           DarkenGround(col, pGround, oceanHeight, wetness);
+          col = applyDrawing(col, pGround);
           
           float spec = max(0.0, dot(refl, -ld));
           spec = pow(spec, 256.0);
@@ -324,6 +339,7 @@ export const oceanFragmentShader = `
           pGround = p;
           float wetness;
           DarkenGround(col, pGround, oceanHeight, wetness);
+          col = applyDrawing(col, pGround);
           
           vec3 nor = Normal(p);
           vec3 refl = reflect(rd, nor);
